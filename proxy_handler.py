@@ -14,13 +14,17 @@ Supported protocols:
   anytls://password@host:port?sni=xxx&fp=chrome
   tuic://uuid:password@host:port?sni=xxx&alpn=h3&congestion_control=bbr
 
-Output: config.json with HTTP inbound on 127.0.0.1:8080
+Subscription URLs are supported: PROXY_URL or SUBSCRIPTION_URL may point to a
+base64/plain-text proxy subscription. Nodes are converted to sing-box outbounds
+and combined with urltest. Output: config.json with HTTP inbound on 127.0.0.1:8080
 """
 
 import os
 import sys
 import json
 import base64
+import ssl
+import urllib.request
 from urllib.parse import urlparse, parse_qs, unquote
 
 LISTEN_HOST = "127.0.0.1"
@@ -318,6 +322,152 @@ def parse_tuic(parsed, params):
 
 
 # ============================================================
+# Subscription Support
+# ============================================================
+
+SUPPORTED_URI_SCHEMES = (
+    "socks5", "http", "https", "vless", "vmess",
+    "hy2", "hysteria2", "trojan", "anytls", "tuic"
+)
+
+
+def _looks_like_subscription_url(url_str):
+    """Distinguish a subscription URL from a normal HTTP proxy URL."""
+    try:
+        p = urlparse(url_str)
+        if p.scheme not in ("http", "https"):
+            return False
+
+        # A normal HTTP proxy is usually http(s)://host:port.
+        # Subscription links normally have a path and/or query token.
+        if p.query or (p.path and p.path != "/"):
+            return True
+        if p.port is None:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _decode_subscription_body(raw):
+    """Decode common subscription formats: plain URI list or base64 URI list."""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    raw = raw.strip()
+
+    if not raw:
+        return []
+
+    # Plain text URI list.
+    lines = [x.strip() for x in raw.splitlines() if x.strip()]
+    uri_lines = [x for x in lines if re.match(
+        r"^(?:socks5|http|https|vless|vmess|hy2|hysteria2|trojan|anytls|tuic)://",
+        x, re.I
+    )]
+    if uri_lines:
+        return uri_lines
+
+    # Most subscription services return base64 encoded URI lists.
+    compact = re.sub(r"\s+", "", raw)
+    candidates = [compact]
+    pad = (-len(compact)) % 4
+    if pad:
+        candidates.append(compact + "=" * pad)
+
+    for candidate in candidates:
+        try:
+            decoded = base64.b64decode(candidate, validate=False).decode(
+                "utf-8", errors="replace"
+            )
+            decoded_lines = [
+                x.strip() for x in decoded.splitlines() if x.strip()
+            ]
+            uri_lines = [x for x in decoded_lines if re.match(
+                r"^(?:socks5|http|https|vless|vmess|hy2|hysteria2|trojan|anytls|tuic)://",
+                x, re.I
+            )]
+            if uri_lines:
+                return uri_lines
+        except Exception:
+            pass
+
+    return []
+
+
+def _fetch_subscription(url):
+    """Download subscription content over HTTP/HTTPS."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "sing-box-subscription-client/1.0",
+            "Accept": "*/*",
+        },
+    )
+
+    # Keep HTTPS verification enabled by default.
+    with urllib.request.urlopen(req, timeout=20) as response:
+        body = response.read()
+        return _decode_subscription_body(body)
+
+
+def _parse_proxy_uri(url_str):
+    """Parse one proxy URI using the existing protocol parsers."""
+    scheme = url_str.split("://", 1)[0].lower()
+
+    if scheme == "vmess":
+        return parse_vmess(url_str)
+
+    parsed = urlparse(url_str)
+    params = parse_qs(parsed.query)
+
+    if scheme == "socks5":
+        return parse_socks5(parsed)
+    elif scheme in ("http", "https"):
+        return parse_http(parsed)
+    elif scheme == "vless":
+        return parse_vless(parsed, params)
+    elif scheme in ("hy2", "hysteria2"):
+        return parse_hysteria2(parsed, params)
+    elif scheme == "trojan":
+        return parse_trojan(parsed, params)
+    elif scheme == "anytls":
+        return parse_anytls(parsed, params)
+    elif scheme == "tuic":
+        return parse_tuic(parsed, params)
+
+    raise ValueError(f"Unsupported protocol: {scheme}")
+
+
+def _build_subscription_outbounds(uri_list):
+    """Convert all subscription nodes into sing-box outbounds + urltest."""
+    outbounds = []
+    tags = []
+
+    for i, uri in enumerate(uri_list, 1):
+        try:
+            outbound = _parse_proxy_uri(uri)
+            outbound["tag"] = f"node-{i}"
+            outbounds.append(outbound)
+            tags.append(f"node-{i}")
+        except Exception as e:
+            print(f"  Skip subscription node #{i}: {e}")
+
+    if not outbounds:
+        raise ValueError("No supported proxy nodes found in subscription")
+
+    # One urltest group automatically selects a working/fast node.
+    outbounds.append({
+        "type": "urltest",
+        "tag": "proxy",
+        "outbounds": tags,
+        "url": "https://www.gstatic.com/generate_204",
+        "interval": "30s",
+    })
+    outbounds.append({"type": "direct", "tag": "direct"})
+    return outbounds
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -362,36 +512,77 @@ def _build_pool_outbounds(base_out, pool_nodes):
 
 def main():
     proxy_url = os.environ.get("PROXY_URL", "").strip()
-    if not proxy_url:
-        print("PROXY_URL is empty, skipping sing-box config generation.")
+    subscription_url = os.environ.get("SUBSCRIPTION_URL", "").strip()
+
+    # SUBSCRIPTION_URL has priority. Otherwise PROXY_URL can itself be a
+    # subscription URL (for example: https://host/path?token=xxx).
+    source_url = subscription_url or proxy_url
+
+    if not source_url:
+        print("PROXY_URL/SUBSCRIPTION_URL is empty, skipping sing-box config generation.")
         sys.exit(0)
 
+    # ------------------------------------------------------------
+    # Subscription mode
+    # ------------------------------------------------------------
+    if subscription_url or _looks_like_subscription_url(source_url):
+        print("Subscription mode: downloading subscription...")
+        print(f"  URL: {source_url.split('?', 1)[0]}***")
+
+        try:
+            uri_list = _fetch_subscription(source_url)
+        except Exception as e:
+            print(f"Failed to download subscription: {e}")
+            sys.exit(1)
+
+        if not uri_list:
+            print("Subscription downloaded, but no supported proxy URI was found.")
+            print("Supported: vless/vmess/trojan/hy2/anytls/tuic/socks5/http")
+            sys.exit(1)
+
+        print(f"  Found {len(uri_list)} proxy nodes")
+
+        try:
+            outbounds = _build_subscription_outbounds(uri_list)
+        except Exception as e:
+            print(f"Failed to build subscription outbounds: {e}")
+            sys.exit(1)
+
+        config = {
+            "log": {"level": "info", "timestamp": True},
+            "inbounds": [
+                {
+                    "type": "http",
+                    "tag": "http-in",
+                    "listen": LISTEN_HOST,
+                    "listen_port": LISTEN_PORT,
+                }
+            ],
+            "outbounds": outbounds,
+            "route": {"final": "proxy"},
+        }
+
+        with open("config.json", "w") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+
+        print("sing-box config.json generated from subscription.")
+        print(f"  Inbound: http://{LISTEN_HOST}:{LISTEN_PORT}")
+        print(f"  Nodes: {len(uri_list)}")
+        print("  Selector: urltest -> proxy")
+        return
+
+    # ------------------------------------------------------------
+    # Single proxy URI mode (original behavior)
+    # ------------------------------------------------------------
+    proxy_url = source_url
     scheme = proxy_url.split("://")[0].lower()
     print(f"Parsing proxy URI ({scheme}://***)")
 
-    if scheme == "vmess":
-        outbound = parse_vmess(proxy_url)
-    else:
-        parsed = urlparse(proxy_url)
-        params = parse_qs(parsed.query)
-
-        if scheme == "socks5":
-            outbound = parse_socks5(parsed)
-        elif scheme in ("http", "https"):
-            outbound = parse_http(parsed)
-        elif scheme == "vless":
-            outbound = parse_vless(parsed, params)
-        elif scheme in ("hy2", "hysteria2"):
-            outbound = parse_hysteria2(parsed, params)
-        elif scheme == "trojan":
-            outbound = parse_trojan(parsed, params)
-        elif scheme == "anytls":
-            outbound = parse_anytls(parsed, params)
-        elif scheme == "tuic":
-            outbound = parse_tuic(parsed, params)
-        else:
-            print(f"Unsupported protocol: {scheme}")
-            sys.exit(1)
+    try:
+        outbound = _parse_proxy_uri(proxy_url)
+    except Exception as e:
+        print(f"Unsupported/invalid proxy URI: {e}")
+        sys.exit(1)
 
     # If the base proxy is anytls and a pool.json exists, expand into
     # multiple node outbounds + a urltest group (auto-pick a reachable node).
@@ -415,7 +606,6 @@ def main():
             }
         ],
         "outbounds": outbounds,
-        # Without this, curl through the HTTP inbound has no outbound to use.
         "route": {"final": "proxy"},
     }
 
@@ -424,7 +614,7 @@ def main():
 
     server = outbound.get("server", "N/A")
     port = outbound.get("server_port", "N/A")
-    print(f"sing-box config.json generated.")
+    print("sing-box config.json generated.")
     print(f"  Inbound: http://{LISTEN_HOST}:{LISTEN_PORT}")
     print(f"  Outbound: {outbound['type']} -> {server}:{port}")
 
