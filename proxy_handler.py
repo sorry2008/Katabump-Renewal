@@ -1,1919 +1,310 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-"""
-proxy_handler.py
-
-功能：
-1. 支持单个代理 URI
-2. 支持订阅 URL
-3. 自动识别 Base64 / 明文订阅
-4. 自动解析：
-   - socks5
-   - http
-   - https
-   - vless
-   - vmess
-   - hysteria2 / hy2
-   - anytls
-   - trojan
-   - tuic
-5. 订阅模式下：
-   - 下载订阅
-   - 解析全部节点
-   - 逐个测试节点
-   - 只保留可用节点
-   - 使用第一个可用节点作为 proxy
-   - 其余可用节点作为备用 urltest 节点
-
-输出：
-config.json
-
-HTTP 入站：
-127.0.0.1:8080
-"""
-
-import os
-import sys
-import json
-import base64
-import re
-import socket
-import ssl
-import urllib.request
-import urllib.error
-
+"""Parse PROXY_URL (single URI or subscription) and generate sing-box config."""
+import base64, copy, json, os, re, sys
 from urllib.parse import urlparse, parse_qs, unquote
-
 
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 8080
-
-TEST_URL = os.environ.get(
-    "PROXY_TEST_URL",
-    "https://www.gstatic.com/generate_204"
-)
-
-TEST_TIMEOUT = float(
-    os.environ.get("PROXY_TEST_TIMEOUT", "8")
-)
-
-SUBSCRIPTION_TIMEOUT = int(
-    os.environ.get("SUBSCRIPTION_TIMEOUT", "20")
-)
-
-
-SUPPORTED_SCHEMES = {
-    "socks5",
-    "socks",
-    "http",
-    "https",
-    "vless",
-    "vmess",
-    "hy2",
-    "hysteria2",
-    "anytls",
-    "trojan",
-    "tuic",
-}
-
-
-# ============================================================
-# Utility
-# ============================================================
-
-def safe_tag(name, index):
-    """
-    清理节点名称，生成 sing-box 可用 tag。
-    """
-    name = unquote(str(name or "")).strip()
-
-    name = re.sub(
-        r"[\x00-\x1f\x7f]",
-        "",
-        name
-    )
-
-    name = re.sub(
-        r"\s+",
-        " ",
-        name
-    )
-
-    if not name:
-        name = f"node-{index}"
-
-    return name[:120]
-
-
-def unique_tag(tag, existing):
-    """
-    防止节点名称重复。
-    """
-    if tag not in existing:
-        return tag
-
-    i = 2
-
-    while f"{tag}-{i}" in existing:
-        i += 1
-
-    return f"{tag}-{i}"
-
-
-# ============================================================
-# Protocol Parsers
-# ============================================================
-
-def parse_socks5(parsed):
-    outbound = {
-        "type": "socks",
-        "tag": "proxy",
-        "server": parsed.hostname,
-        "server_port": parsed.port or 1080,
-        "version": "5",
-    }
-
-    if parsed.username:
-        outbound["username"] = unquote(parsed.username)
-
-    if parsed.password:
-        outbound["password"] = unquote(parsed.password)
-
-    return outbound
-
-
-def parse_http(parsed):
-    outbound = {
-        "type": "http",
-        "tag": "proxy",
-        "server": parsed.hostname,
-        "server_port": parsed.port or 8080,
-    }
-
-    if parsed.username:
-        outbound["username"] = unquote(parsed.username)
-
-    if parsed.password:
-        outbound["password"] = unquote(parsed.password)
-
-    if parsed.scheme.lower() == "https":
-        outbound["tls"] = {
-            "enabled": True
-        }
-
-    return outbound
-
-
-def parse_vless(parsed, params):
-
-    outbound = {
-        "type": "vless",
-        "tag": "proxy",
-        "server": parsed.hostname,
-        "server_port": parsed.port or 443,
-        "uuid": unquote(parsed.username or ""),
-    }
-
-    flow = params.get(
-        "flow",
-        [""]
-    )[0]
-
-    if flow:
-        outbound["flow"] = flow
-
-    security = params.get(
-        "security",
-        [""]
-    )[0].lower()
-
-    if security in (
-        "tls",
-        "reality"
-    ):
-
-        tls = {
-            "enabled": True
-        }
-
-        sni = (
-            params.get("sni", [""])[0]
-            or params.get("peer", [""])[0]
-            or params.get("host", [""])[0]
-        )
-
-        if sni:
-            tls["server_name"] = unquote(sni)
-
-        fp = (
-            params.get("fp", [""])[0]
-            or params.get(
-                "client-fingerprint",
-                [""]
-            )[0]
-        )
-
-        if fp:
-            tls["utls"] = {
-                "enabled": True,
-                "fingerprint": fp,
-            }
-
-        alpn = params.get(
-            "alpn",
-            [""]
-        )[0]
-
-        if alpn:
-            tls["alpn"] = [
-                x for x in alpn.split(",")
-                if x
-            ]
-
-        insecure = params.get(
-            "insecure",
-            params.get(
-                "allowInsecure",
-                ["0"]
-            )
-        )[0]
-
-        if insecure == "1":
-            tls["insecure"] = True
-
-        if security == "reality":
-
-            reality = {
-                "enabled": True
-            }
-
-            pbk = params.get(
-                "pbk",
-                [""]
-            )[0]
-
-            if pbk:
-                reality["public_key"] = pbk
-
-            sid = params.get(
-                "sid",
-                [""]
-            )[0]
-
-            if sid:
-                reality["short_id"] = sid
-
-            spx = params.get(
-                "spx",
-                [""]
-            )[0]
-
-            if spx:
-                reality["spider_x"] = unquote(spx)
-
-            tls["reality"] = reality
-
-        outbound["tls"] = tls
-
-    net_type = params.get(
-        "type",
-        [""]
-    )[0].lower()
-
-    if net_type == "ws":
-
-        transport = {
-            "type": "ws"
-        }
-
-        path = params.get(
-            "path",
-            [""]
-        )[0]
-
-        if path:
-            transport["path"] = unquote(path)
-
-        host = params.get(
-            "host",
-            [""]
-        )[0]
-
-        if host:
-            transport["headers"] = {
-                "Host": unquote(host)
-            }
-
-        outbound["transport"] = transport
-
-    elif net_type == "grpc":
-
-        transport = {
-            "type": "grpc"
-        }
-
-        service_name = (
-            params.get(
-                "serviceName",
-                [""]
-            )[0]
-            or params.get(
-                "service_name",
-                [""]
-            )[0]
-        )
-
-        if service_name:
-            transport["service_name"] = unquote(
-                service_name
-            )
-
-        outbound["transport"] = transport
-
-    elif net_type in (
-        "http",
-        "h2"
-    ):
-
-        transport = {
-            "type": "http"
-        }
-
-        path = params.get(
-            "path",
-            [""]
-        )[0]
-
-        if path:
-            transport["path"] = unquote(path)
-
-        host = params.get(
-            "host",
-            [""]
-        )[0]
-
-        if host:
-            transport["host"] = [
-                unquote(host)
-            ]
-
-        outbound["transport"] = transport
-
-    return outbound
-
-
-def parse_vmess(url_str):
-
-    encoded = url_str[
-        len("vmess://"):
-    ].strip()
-
-    encoded = encoded.replace(
-        "-",
-        "+"
-    ).replace(
-        "_",
-        "/"
-    )
-
-    padding = (
-        4 - len(encoded) % 4
-    ) % 4
-
-    encoded += "=" * padding
-
-    decoded = base64.b64decode(
-        encoded
-    ).decode(
-        "utf-8-sig"
-    )
-
-    cfg = json.loads(decoded)
-
-    outbound = {
-        "type": "vmess",
-        "tag": "proxy",
-        "server": cfg.get(
-            "add",
-            ""
-        ),
-        "server_port": int(
-            cfg.get(
-                "port",
-                443
-            )
-        ),
-        "uuid": cfg.get(
-            "id",
-            ""
-        ),
-        "security": cfg.get(
-            "scy",
-            "auto"
-        ),
-        "alter_id": int(
-            cfg.get(
-                "aid",
-                0
-            )
-        ),
-    }
-
-    if cfg.get("tls") == "tls":
-
-        tls = {
-            "enabled": True
-        }
-
-        sni = (
-            cfg.get("sni")
-            or cfg.get("host")
-            or ""
-        )
-
-        if sni:
-            tls["server_name"] = sni
-
-        alpn = cfg.get(
-            "alpn",
-            ""
-        )
-
-        if alpn:
-            tls["alpn"] = [
-                x for x in alpn.split(",")
-                if x
-            ]
-
-        outbound["tls"] = tls
-
-    net = cfg.get(
-        "net",
-        "tcp"
-    )
-
-    if net == "ws":
-
-        transport = {
-            "type": "ws"
-        }
-
-        path = cfg.get(
-            "path",
-            ""
-        )
-
-        if path:
-            transport["path"] = path
-
-        host = cfg.get(
-            "host",
-            ""
-        )
-
-        if host:
-            transport["headers"] = {
-                "Host": host
-            }
-
-        outbound["transport"] = transport
-
-    elif net == "grpc":
-
-        transport = {
-            "type": "grpc"
-        }
-
-        service_name = (
-            cfg.get("serviceName")
-            or cfg.get("path")
-            or ""
-        )
-
-        if service_name:
-            transport["service_name"] = service_name
-
-        outbound["transport"] = transport
-
-    elif net in (
-        "h2",
-        "http"
-    ):
-
-        transport = {
-            "type": "http"
-        }
-
-        path = cfg.get(
-            "path",
-            ""
-        )
-
-        if path:
-            transport["path"] = path
-
-        host = cfg.get(
-            "host",
-            ""
-        )
-
-        if host:
-            transport["host"] = [
-                host
-            ]
-
-        outbound["transport"] = transport
-
-    return outbound
-
-
-def parse_hysteria2(parsed, params):
-
-    outbound = {
-        "type": "hysteria2",
-        "tag": "proxy",
-        "server": parsed.hostname,
-        "server_port": parsed.port or 443,
-        "password": unquote(
-            parsed.username or ""
-        ),
-    }
-
-    tls = {
-        "enabled": True
-    }
-
-    sni = (
-        params.get("sni", [""])[0]
-        or params.get("peer", [""])[0]
-    )
-
-    if sni:
-        tls["server_name"] = unquote(sni)
-
-    insecure = params.get(
-        "insecure",
-        params.get(
-            "allowInsecure",
-            ["0"]
-        )
-    )[0]
-
-    if insecure == "1":
-        tls["insecure"] = True
-
-    alpn = params.get(
-        "alpn",
-        [""]
-    )[0]
-
-    if alpn:
-        tls["alpn"] = [
-            x for x in alpn.split(",")
-            if x
-        ]
-
-    outbound["tls"] = tls
-
-    obfs = params.get(
-        "obfs",
-        [""]
-    )[0]
-
-    if obfs:
-
-        obfs_password = params.get(
-            "obfs-password",
-            [""]
-        )[0]
-
-        outbound["obfs"] = {
-            "type": obfs,
-            "password": obfs_password,
-        }
-
-    return outbound
-
-
-def parse_anytls(parsed, params):
-
-    outbound = {
-        "type": "anytls",
-        "tag": "proxy",
-        "server": parsed.hostname,
-        "server_port": parsed.port or 443,
-        "password": unquote(
-            parsed.username or ""
-        ),
-    }
-
-    tls = {
-        "enabled": True
-    }
-
-    sni = (
-        params.get("sni", [""])[0]
-        or params.get("peer", [""])[0]
-    )
-
-    if sni:
-        tls["server_name"] = unquote(sni)
-
-    fp = (
-        params.get("fp", [""])[0]
-        or params.get(
-            "client-fingerprint",
-            [""]
-        )[0]
-    )
-
-    if fp:
-        tls["utls"] = {
-            "enabled": True,
-            "fingerprint": fp,
-        }
-
-    insecure = params.get(
-        "insecure",
-        params.get(
-            "allowInsecure",
-            ["0"]
-        )
-    )[0]
-
-    if insecure == "1":
-        tls["insecure"] = True
-
-    outbound["tls"] = tls
-
-    return outbound
-
-
-def parse_trojan(parsed, params):
-
-    outbound = {
-        "type": "trojan",
-        "tag": "proxy",
-        "server": parsed.hostname,
-        "server_port": parsed.port or 443,
-        "password": unquote(
-            parsed.username or ""
-        ),
-    }
-
-    tls = {
-        "enabled": True
-    }
-
-    sni = (
-        params.get("sni", [""])[0]
-        or params.get("peer", [""])[0]
-        or params.get("host", [""])[0]
-    )
-
-    if sni:
-        tls["server_name"] = unquote(sni)
-
-    fp = (
-        params.get("fp", [""])[0]
-        or params.get(
-            "client-fingerprint",
-            [""]
-        )[0]
-    )
-
-    if fp:
-        tls["utls"] = {
-            "enabled": True,
-            "fingerprint": fp,
-        }
-
-    insecure = params.get(
-        "insecure",
-        params.get(
-            "allowInsecure",
-            ["0"]
-        )
-    )[0]
-
-    if insecure == "1":
-        tls["insecure"] = True
-
-    alpn = params.get(
-        "alpn",
-        [""]
-    )[0]
-
-    if alpn:
-        tls["alpn"] = [
-            x for x in alpn.split(",")
-            if x
-        ]
-
-    outbound["tls"] = tls
-
-    transport_type = params.get(
-        "type",
-        [""]
-    )[0].lower()
-
-    if transport_type == "ws":
-
-        ws = {
-            "type": "ws"
-        }
-
-        path = params.get(
-            "path",
-            [""]
-        )[0]
-
-        if path:
-            ws["path"] = unquote(path)
-
-        host = params.get(
-            "host",
-            [""]
-        )[0]
-
-        if host:
-            ws["headers"] = {
-                "Host": unquote(host)
-            }
-
-        outbound["transport"] = ws
-
-    elif transport_type == "grpc":
-
-        grpc = {
-            "type": "grpc"
-        }
-
-        service_name = (
-            params.get(
-                "serviceName",
-                [""]
-            )[0]
-            or params.get(
-                "service_name",
-                [""]
-            )[0]
-        )
-
-        if service_name:
-            grpc["service_name"] = unquote(
-                service_name
-            )
-
-        outbound["transport"] = grpc
-
-    return outbound
-
-
-def parse_tuic(parsed, params):
-
-    outbound = {
-        "type": "tuic",
-        "tag": "proxy",
-        "server": parsed.hostname,
-        "server_port": parsed.port or 443,
-        "uuid": "",
-        "password": "",
-        "congestion_control": params.get(
-            "congestion_control",
-            ["bbr"]
-        )[0],
-    }
-
-    user_part = unquote(
-        parsed.username or ""
-    )
-
-    pass_part = unquote(
-        parsed.password or ""
-    )
-
-    if ":" in user_part and not pass_part:
-
-        outbound["uuid"], outbound["password"] = (
-            user_part.split(
-                ":",
-                1
-            )
-        )
-
-    else:
-
-        outbound["uuid"] = user_part
-        outbound["password"] = pass_part
-
-    tls = {
-        "enabled": True
-    }
-
-    sni = (
-        params.get("sni", [""])[0]
-        or params.get("peer", [""])[0]
-    )
-
-    if sni:
-        tls["server_name"] = unquote(sni)
-
-    insecure = params.get(
-        "insecure",
-        params.get(
-            "allowInsecure",
-            ["0"]
-        )
-    )[0]
-
-    if insecure == "1":
-        tls["insecure"] = True
-
-    alpn = params.get(
-        "alpn",
-        [""]
-    )[0]
-
-    if alpn:
-        tls["alpn"] = [
-            x for x in alpn.split(",")
-            if x
-        ]
-
-    outbound["tls"] = tls
-
-    return outbound
-
-
-# ============================================================
-# URI parser
-# ============================================================
-
-def parse_proxy_uri(uri):
-
-    uri = uri.strip()
-
-    if not uri:
-        raise ValueError(
-            "empty URI"
-        )
-
-    scheme = uri.split(
-        "://",
-        1
-    )[0].lower()
-
-    if scheme == "socks":
-        scheme = "socks5"
-        uri = "socks5://" + uri.split(
-            "://",
-            1
-        )[1]
-
-    if scheme == "vmess":
-
-        outbound = parse_vmess(uri)
-
+TEST_URL = "https://www.gstatic.com/generate_204"
+SUPPORTED = {"vless","vmess","trojan","hysteria2","hy2","anytls","tuic","socks5","socks","http","https"}
+
+def first(p,*names,default=""):
+    for n in names:
+        v=p.get(n)
+        if v is not None and v != "": return v[0] if isinstance(v,list) else v
+    return default
+
+def boolean(v): return str(v).lower() in ("1","true","yes","on") if not isinstance(v,bool) else v
+
+def i(v,d):
+    try:return int(v)
+    except:return d
+
+def tls_params(p, default=True):
+    security=first(p,"security",default="")
+    if not (default or security in ("tls","reality")): return None
+    t={"enabled":True}
+    sni=first(p,"sni","servername","server_name","peer",default="")
+    if sni:t["server_name"]=unquote(str(sni))
+    fp=first(p,"fp","client-fingerprint","fingerprint",default="")
+    if fp:t["utls"]={"enabled":True,"fingerprint":fp}
+    alpn=first(p,"alpn",default="")
+    if alpn:t["alpn"]=[x.strip() for x in str(alpn).split(",") if x.strip()]
+    if boolean(first(p,"insecure","allowInsecure",default="0")):t["insecure"]=True
+    if security=="reality" or first(p,"pbk",default=""):
+        r={"enabled":True}
+        pbk=first(p,"pbk","public-key","public_key",default="")
+        sid=first(p,"sid","short-id","short_id",default="")
+        if pbk:r["public_key"]=pbk
+        if sid:r["short_id"]=sid
+        t["reality"]=r
+    return t
+
+def transport(p):
+    n=first(p,"type","network","net",default="").lower()
+    if n in ("ws","websocket"):
+        t={"type":"ws"}; path=first(p,"path",default=""); host=first(p,"host","ws-host",default="")
+        if path:t["path"]=unquote(path)
+        if host:t["headers"]={"Host":host}
+        return t
+    if n=="grpc":
+        t={"type":"grpc"}; s=first(p,"serviceName","service_name","grpc-service-name",default="")
+        if s:t["service_name"]=s
+        return t
+    if n in ("h2","http"):
+        t={"type":"http"}; path=first(p,"path",default=""); host=first(p,"host",default="")
+        if path:t["path"]=unquote(path)
+        if host:t["host"]= [host]
+        return t
+    return None
+
+def parse_uri(uri):
+    uri=uri.strip().strip("\"'").rstrip(",;)")
+    p=urlparse(uri); s=p.scheme.lower()
+    if s not in SUPPORTED: raise ValueError("unsupported scheme")
+    if s=="vmess": return parse_vmess(uri)
+    q=parse_qs(p.query,keep_blank_values=True)
+    if s in ("socks5","socks"):
+        o={"type":"socks","tag":"proxy","server":p.hostname,"server_port":p.port or 1080,"version":"5"}
+        if p.username:o["username"]=unquote(p.username)
+        if p.password:o["password"]=unquote(p.password)
+        return o
+    if s in ("http","https"):
+        o={"type":"http","tag":"proxy","server":p.hostname,"server_port":p.port or 8080}
+        if p.username:o["username"]=unquote(p.username)
+        if p.password:o["password"]=unquote(p.password)
+        if s=="https":o["tls"]={"enabled":True}
+        return o
+    if s=="vless":
+        o={"type":"vless","tag":"proxy","server":p.hostname,"server_port":p.port or 443,"uuid":unquote(p.username or "")}
+        if not o["uuid"]:raise ValueError("empty vless uuid")
+        flow=first(q,"flow",default="")
+        if flow:o["flow"]=flow
+        t=tls_params(q,False)
+        if t:o["tls"]=t
+        tr=transport(q)
+        if tr:o["transport"]=tr
+        return o
+    if s=="trojan":
+        o={"type":"trojan","tag":"proxy","server":p.hostname,"server_port":p.port or 443,"password":unquote(p.username or "")}
+        if not o["password"]:raise ValueError("empty trojan password")
+        o["tls"]=tls_params(q,True); tr=transport(q)
+        if tr:o["transport"]=tr
+        return o
+    if s in ("hy2","hysteria2"):
+        o={"type":"hysteria2","tag":"proxy","server":p.hostname,"server_port":p.port or 443,"password":unquote(p.username or "")}
+        if not o["password"]:raise ValueError("empty hysteria2 password")
+        o["tls"]=tls_params(q,True)
+        ob=first(q,"obfs",default="")
+        if ob:o["obfs"]={"type":ob,"password":first(q,"obfs-password","obfs_password",default="")}
+        return o
+    if s=="anytls":
+        o={"type":"anytls","tag":"proxy","server":p.hostname,"server_port":p.port or 443,"password":unquote(p.username or "")}
+        if not o["password"]:raise ValueError("empty anytls password")
+        o["tls"]=tls_params(q,True); return o
+    if s=="tuic":
+        u=unquote(p.username or ""); pw=unquote(p.password or "")
+        if ":" in u and not pw:u,pw=u.split(":",1)
+        o={"type":"tuic","tag":"proxy","server":p.hostname,"server_port":p.port or 443,"uuid":u,"password":pw,"congestion_control":first(q,"congestion_control","congestion-control",default="bbr")}
+        o["tls"]=tls_params(q,True); return o
+
+def b64decode(s):
+    s=re.sub(r"\s+","",s).replace("-","+").replace("_","/"); s += "="*((4-len(s)%4)%4)
+    return base64.b64decode(s).decode("utf-8-sig",errors="replace")
+
+def parse_vmess(uri):
+    cfg=json.loads(b64decode(uri.split("://",1)[1]))
+    o={"type":"vmess","tag":cfg.get("ps") or "proxy","server":cfg.get("add") or cfg.get("server"),"server_port":i(cfg.get("port"),443),"uuid":cfg.get("id", ""),"security":cfg.get("scy","auto") or "auto","alter_id":i(cfg.get("aid"),0)}
+    if not o["server"]:raise ValueError("empty vmess server")
+    if str(cfg.get("tls","")).lower()=="tls" or cfg.get("sni"):
+        t={"enabled":True}; sni=cfg.get("sni") or cfg.get("host")
+        if sni:t["server_name"]=sni
+        if cfg.get("alpn"):t["alpn"]=cfg["alpn"] if isinstance(cfg["alpn"],list) else [x.strip() for x in str(cfg["alpn"]).split(",")]
+        o["tls"]=t
+    n=str(cfg.get("net","tcp")).lower()
+    if n=="ws":
+        t={"type":"ws"};
+        if cfg.get("path"):t["path"]=cfg["path"]
+        if cfg.get("host"):t["headers"]={"Host":cfg["host"]}
+        o["transport"]=t
+    elif n=="grpc":
+        t={"type":"grpc"};
+        if cfg.get("path"):t["service_name"]=cfg["path"]
+        o["transport"]=t
+    elif n in ("h2","http"):
+        t={"type":"http"};
+        if cfg.get("path"):t["path"]=cfg["path"]
+        if cfg.get("host"):t["host"]=[cfg["host"]]
+        o["transport"]=t
+    return o
+
+URI_RE=re.compile(r"(?i)\b(?:vless|vmess|trojan|hysteria2|hy2|anytls|tuic|socks5|socks|https?|http)://[^\s<>\[\]\"'`]+")
+
+def decode_candidates(body):
+    text=body.decode("utf-8-sig",errors="replace") if isinstance(body,bytes) else str(body)
+    c=[text]
+    u=unquote(text)
+    if u!=text:c.append(u)
+    for x in list(c):
         try:
+            d=b64decode(x.strip())
+            if any(k in d.lower() for k in ("vless://","vmess://","trojan://","hysteria2://","hy2://","anytls://","tuic://","socks5://","proxies:","\"proxies\"")):c.append(d)
+        except:pass
+    return c
 
-            encoded = uri[
-                len("vmess://"):
-            ]
+def clash_to_ob(n):
+    if not isinstance(n,dict):return None
+    typ=str(n.get("type","")).lower(); server=n.get("server") or n.get("add"); port=i(n.get("port"),443); name=n.get("name") or n.get("ps") or "proxy"
+    if not server:return None
+    if typ in ("socks","socks5"):
+        o={"type":"socks","tag":name,"server":server,"server_port":port,"version":"5"}
+        for k in ("username","password"):
+            if n.get(k) is not None:o[k]=str(n[k])
+        return o
+    if typ in ("http","https"):
+        o={"type":"http","tag":name,"server":server,"server_port":port}
+        for k in ("username","password"):
+            if n.get(k) is not None:o[k]=str(n[k])
+        if typ=="https":o["tls"]={"enabled":True}
+        return o
+    if typ in ("trojan","vless","hysteria2","hy2","tuic","anytls","vmess"):
+        # Normalize Clash/Mihomo nodes into URI-like sing-box structures.
+        if typ=="trojan":
+            o={"type":"trojan","tag":name,"server":server,"server_port":port,"password":str(n.get("password","")),"tls":{"enabled":True}}
+            s=n.get("sni") or n.get("servername");
+            if s:o["tls"]["server_name"]=str(s)
+            if n.get("skip-cert-verify"):o["tls"]["insecure"]=True
+            return o
+        if typ=="vless":
+            o={"type":"vless","tag":name,"server":server,"server_port":port,"uuid":str(n.get("uuid") or n.get("id") or "")}
+            if n.get("flow"):o["flow"]=str(n["flow"])
+            if n.get("tls") or n.get("servername") or n.get("sni"):
+                o["tls"]={"enabled":True}; s=n.get("servername") or n.get("sni")
+                if s:o["tls"]["server_name"]=str(s)
+                if n.get("skip-cert-verify"):o["tls"]["insecure"]=True
+            return o
+        if typ in ("hysteria2","hy2"):
+            o={"type":"hysteria2","tag":name,"server":server,"server_port":port,"password":str(n.get("password","")),"tls":{"enabled":True}}
+            s=n.get("sni") or n.get("servername")
+            if s:o["tls"]["server_name"]=str(s)
+            if n.get("skip-cert-verify"):o["tls"]["insecure"]=True
+            return o
+        if typ=="tuic":
+            return {"type":"tuic","tag":name,"server":server,"server_port":port,"uuid":str(n.get("uuid","")),"password":str(n.get("password","")),"congestion_control":str(n.get("congestion-controller","bbr")),"tls":{"enabled":True,"server_name":str(n.get("sni") or n.get("servername") or "")}}
+        if typ=="anytls":
+            o={"type":"anytls","tag":name,"server":server,"server_port":port,"password":str(n.get("password","")),"tls":{"enabled":True}}
+            s=n.get("sni") or n.get("servername");
+            if s:o["tls"]["server_name"]=str(s)
+            return o
+        # vmess
+        raw={"add":server,"port":port,"id":n.get("uuid") or n.get("id"),"aid":n.get("alterId",n.get("alter-id",0)),"scy":n.get("cipher","auto"),"tls":"tls" if n.get("tls") else "","sni":n.get("servername") or n.get("sni"),"net":n.get("network","tcp")}
+        return dict(parse_vmess("vmess://"+base64.b64encode(json.dumps(raw).encode()).decode()),tag=name)
+    return None
 
-            padding = (
-                4 - len(encoded) % 4
-            ) % 4
+def parse_fallback_yaml(text):
+    lines=text.replace("\r\n","\n").split("\n"); start=None
+    for j,l in enumerate(lines):
+        if re.match(r"^\s*proxies\s*:\s*$",l,re.I):start=j+1;break
+    if start is None:return []
+    out=[]; cur=None
+    for l in lines[start:]:
+        if l and not l.startswith((" ","\t")):break
+        m=re.match(r"^\s*-\s*(.*)$",l)
+        if m:
+            if cur:out.append(cur)
+            cur={}; rest=m.group(1)
+            if ":" in rest:
+                k,v=rest.split(":",1);cur[k.strip()]=v.strip().strip("\"'")
+        elif cur:
+            m=re.match(r"^\s+([^:#][^:]*):\s*(.*)$",l)
+            if m:cur[m.group(1).strip()]=m.group(2).strip().strip("\"'")
+    if cur:out.append(cur)
+    return out
 
-            encoded += "=" * padding
-
-            cfg = json.loads(
-                base64.b64decode(
-                    encoded
-                ).decode(
-                    "utf-8-sig"
-                )
-            )
-
-            name = (
-                cfg.get("ps")
-                or cfg.get("name")
-                or ""
-            )
-
-        except Exception:
-
-            name = ""
-
-        return outbound, name
-
-    parsed = urlparse(uri)
-
-    params = parse_qs(
-        parsed.query
-    )
-
-    name = (
-        parsed.fragment
-        or params.get(
-            "name",
-            [""]
-        )[0]
-    )
-
-    if scheme == "socks5":
-        outbound = parse_socks5(parsed)
-
-    elif scheme in (
-        "http",
-        "https"
-    ):
-        outbound = parse_http(parsed)
-
-    elif scheme == "vless":
-        outbound = parse_vless(
-            parsed,
-            params
-        )
-
-    elif scheme in (
-        "hy2",
-        "hysteria2"
-    ):
-        outbound = parse_hysteria2(
-            parsed,
-            params
-        )
-
-    elif scheme == "anytls":
-        outbound = parse_anytls(
-            parsed,
-            params
-        )
-
-    elif scheme == "trojan":
-        outbound = parse_trojan(
-            parsed,
-            params
-        )
-
-    elif scheme == "tuic":
-        outbound = parse_tuic(
-            parsed,
-            params
-        )
-
-    else:
-
-        raise ValueError(
-            f"Unsupported protocol: {scheme}"
-        )
-
-    return outbound, name
-
-
-# ============================================================
-# Subscription decoder
-# ============================================================
-
-def decode_subscription(raw):
-
-    if isinstance(raw, bytes):
-
-        text = raw.decode(
-            "utf-8-sig",
-            errors="replace"
-        )
-
-    else:
-
-        text = str(raw)
-
-    text = text.strip()
-
-    if not text:
-        return []
-
-    text = text.lstrip(
-        "\ufeff"
-    ).strip()
-
-    uri_pattern = re.compile(
-        r"^(?:"
-        r"socks5|socks|http|https|"
-        r"vless|vmess|hy2|hysteria2|"
-        r"anytls|trojan|tuic"
-        r")://",
-        re.I
-    )
-
-    # --------------------------------------------------------
-    # Plain text
-    # --------------------------------------------------------
-
-    lines = [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip()
-    ]
-
-    uri_lines = [
-        line
-        for line in lines
-        if uri_pattern.match(line)
-    ]
-
-    if uri_lines:
-        return uri_lines
-
-    # --------------------------------------------------------
-    # Base64
-    # --------------------------------------------------------
-
-    compact = re.sub(
-        r"\s+",
-        "",
-        text
-    )
-
-    candidates = []
-
-    candidates.append(
-        compact
-    )
-
-    padding = (
-        4 - len(compact) % 4
-    ) % 4
-
-    if padding:
-        candidates.append(
-            compact + "=" * padding
-        )
-
-    for candidate in candidates:
-
+def collect(body):
+    obs=[]; seen=set()
+    def add(o):
+        if not o or not o.get("server"):return
+        key=(o.get("type"),o.get("server"),o.get("server_port"),o.get("uuid"),o.get("password"))
+        if key in seen:return
+        seen.add(key); o["tag"]=o.get("tag") or "node-%d"%(len(obs)+1);obs.append(o)
+    for text in decode_candidates(body):
+        for uri in URI_RE.findall(text):
+            try:add(parse_uri(uri))
+            except:pass
         try:
-
-            decoded = base64.b64decode(
-                candidate,
-                validate=False
-            ).decode(
-                "utf-8-sig",
-                errors="replace"
-            )
-
-            decoded_lines = [
-                line.strip()
-                for line in decoded.splitlines()
-                if line.strip()
-            ]
-
-            uri_lines = [
-                line
-                for line in decoded_lines
-                if uri_pattern.match(line)
-            ]
-
-            if uri_lines:
-                return uri_lines
-
-        except Exception:
-            pass
-
-    # --------------------------------------------------------
-    # URL-safe Base64
-    # --------------------------------------------------------
-
-    try:
-
-        decoded = base64.urlsafe_b64decode(
-            compact + "=" * (
-                (-len(compact)) % 4
-            )
-        ).decode(
-            "utf-8-sig",
-            errors="replace"
-        )
-
-        decoded_lines = [
-            line.strip()
-            for line in decoded.splitlines()
-            if line.strip()
-        ]
-
-        uri_lines = [
-            line
-            for line in decoded_lines
-            if uri_pattern.match(line)
-        ]
-
-        if uri_lines:
-            return uri_lines
-
-    except Exception:
-        pass
-
-    return []
-
-
-# ============================================================
-# Subscription downloader
-# ============================================================
-
-def fetch_subscription(url):
-
-    print(
-        "  Downloading subscription..."
-    )
-
-    headers = {
-        "User-Agent": os.environ.get(
-            "SUBSCRIPTION_USER_AGENT",
-            "clash.meta/1.19.0"
-        ),
-        "Accept": (
-            "text/plain,"
-            "application/base64,"
-            "application/json,"
-            "*/*"
-        ),
-        "Cache-Control": "no-cache",
-    }
-
-    request = urllib.request.Request(
-        url,
-        headers=headers
-    )
-
-    try:
-
-        with urllib.request.urlopen(
-            request,
-            timeout=SUBSCRIPTION_TIMEOUT
-        ) as response:
-
-            body = response.read()
-
-            print(
-                f"  Subscription downloaded: "
-                f"{len(body)} bytes"
-            )
-
-            return body
-
-    except urllib.error.HTTPError as e:
-
-        raise RuntimeError(
-            f"HTTP {e.code}: {e.reason}"
-        )
-
-    except urllib.error.URLError as e:
-
-        raise RuntimeError(
-            f"Network error: {e.reason}"
-        )
-
-    except Exception as e:
-
-        raise RuntimeError(
-            f"Download failed: {e}"
-        )
-
-
-# ============================================================
-# Subscription URL detection
-# ============================================================
-
-def is_subscription_url(url):
-
-    try:
-
-        parsed = urlparse(url)
-
-        if parsed.scheme.lower() not in (
-            "http",
-            "https"
-        ):
-            return False
-
-        # 例如：
-        #
-        # https://xxx.com/sabusuku?token=xxx
-        #
-        # 这种肯定是订阅 URL。
-
-        if parsed.query:
-            return True
-
-        if parsed.path not in (
-            "",
-            "/"
-        ):
-            return True
-
-        # 没有端口的 HTTP URL，一般也视为订阅。
-        if parsed.port is None:
-            return True
-
-        return False
-
-    except Exception:
-
-        return False
-
-
-# ============================================================
-# Node connectivity helper
-# ============================================================
-
-def tcp_test(server, port, timeout=TEST_TIMEOUT):
-
-    try:
-
-        with socket.create_connection(
-            (
-                server,
-                int(port)
-            ),
-            timeout=timeout
-        ):
-
-            return True
-
-    except Exception:
-
-        return False
-
-
-def test_node_basic(outbound):
-
-    """
-    第一层快速检测：
-
-    这里只检测目标服务器 TCP 端口是否能从
-    GitHub Actions 出网环境建立连接。
-
-    注意：
-    TCP 成功 ≠ 代理一定能用。
-
-    但 TCP 都不通的节点没有必要交给 sing-box。
-    """
-
-    server = outbound.get(
-        "server"
-    )
-
-    port = outbound.get(
-        "server_port"
-    )
-
-    if not server or not port:
-        return False
-
-    return tcp_test(
-        server,
-        port
-    )
-
-
-# ============================================================
-# Subscription builder
-# ============================================================
-
-def build_subscription_outbounds(uri_list):
-
-    parsed_nodes = []
-
-    existing_tags = set()
-
-    print(
-        "  Parsing subscription nodes..."
-    )
-
-    for index, uri in enumerate(
-        uri_list,
-        1
-    ):
-
-        try:
-
-            outbound, name = parse_proxy_uri(
-                uri
-            )
-
-            tag = safe_tag(
-                name,
-                index
-            )
-
-            tag = unique_tag(
-                tag,
-                existing_tags
-            )
-
-            existing_tags.add(
-                tag
-            )
-
-            outbound["tag"] = tag
-
-            parsed_nodes.append(
-                outbound
-            )
-
-        except Exception as e:
-
-            print(
-                f"  Skip node #{index}: {e}"
-            )
-
-    if not parsed_nodes:
-
-        raise RuntimeError(
-            "No supported proxy nodes found"
-        )
-
-    print(
-        f"  Parsed {len(parsed_nodes)} nodes"
-    )
-
-    # --------------------------------------------------------
-    # TCP 筛选
-    # --------------------------------------------------------
-
-    print(
-        "  Testing node TCP connectivity..."
-    )
-
-    reachable = []
-    failed = []
-
-    for index, outbound in enumerate(
-        parsed_nodes,
-        1
-    ):
-
-        server = outbound.get(
-            "server",
-            ""
-        )
-
-        port = outbound.get(
-            "server_port",
-            ""
-        )
-
-        tag = outbound.get(
-            "tag",
-            f"node-{index}"
-        )
-
-        print(
-            f"  [{index}/{len(parsed_nodes)}] "
-            f"{tag} -> {server}:{port}"
-        )
-
-        if test_node_basic(
-            outbound
-        ):
-
-            print(
-                "       TCP OK"
-            )
-
-            reachable.append(
-                outbound
-            )
-
-        else:
-
-            print(
-                "       TCP FAILED"
-            )
-
-            failed.append(
-                outbound
-            )
-
-    print(
-        f"  Reachable nodes: "
-        f"{len(reachable)}"
-    )
-
-    print(
-        f"  Unreachable nodes: "
-        f"{len(failed)}"
-    )
-
-    if not reachable:
-
-        raise RuntimeError(
-            "No reachable proxy nodes. "
-            "All subscription node TCP ports failed."
-        )
-
-    # --------------------------------------------------------
-    # 防止一次性测试 101 个节点
-    #
-    # 只取前 N 个可用节点。
-    # 默认 10 个。
-    # --------------------------------------------------------
-
-    max_nodes = int(
-        os.environ.get(
-            "MAX_PROXY_NODES",
-            "10"
-        )
-    )
-
-    if max_nodes > 0:
-
-        reachable = reachable[
-            :max_nodes
-        ]
-
-    # --------------------------------------------------------
-    # 给节点重新编号
-    # --------------------------------------------------------
-
-    for index, outbound in enumerate(
-        reachable,
-        1
-    ):
-
-        # 保留原名称
-        if not outbound.get(
-            "tag"
-        ):
-            outbound["tag"] = (
-                f"node-{index}"
-            )
-
-    # --------------------------------------------------------
-    # 单节点
-    # --------------------------------------------------------
-
-    if len(reachable) == 1:
-
-        reachable[0]["tag"] = "proxy"
-
-        return [
-            reachable[0],
-            {
-                "type": "direct",
-                "tag": "direct",
-            }
-        ]
-
-    # --------------------------------------------------------
-    # 多节点
-    # --------------------------------------------------------
-
-    node_tags = [
-        node["tag"]
-        for node in reachable
-    ]
-
-    urltest = {
-        "type": "urltest",
-        "tag": "proxy",
-        "outbounds": node_tags,
-        "url": TEST_URL,
-        "interval": os.environ.get(
-            "URLTEST_INTERVAL",
-            "60s"
-        ),
-        "tolerance": int(
-            os.environ.get(
-                "URLTEST_TOLERANCE",
-                "100"
-            )
-        ),
-    }
-
-    return (
-        reachable
-        + [
-            urltest,
-            {
-                "type": "direct",
-                "tag": "direct",
-            }
-        ]
-    )
-
-
-# ============================================================
-# Original pool support
-# ============================================================
+            import yaml
+            obj=yaml.safe_load(text)
+        except:
+            try:obj=json.loads(text)
+            except:obj=None
+        if isinstance(obj,dict):
+            vals=[]
+            for k in ("proxies","nodes","outbounds","servers"):
+                if isinstance(obj.get(k),list):vals += obj[k]
+            for n in vals:add(clash_to_ob(n))
+        elif isinstance(obj,list):
+            for n in obj:add(clash_to_ob(n))
+        for n in parse_fallback_yaml(text):add(clash_to_ob(n))
+    return obs
+
+def fetch(url):
+    import ssl, urllib.request
+    req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 Katabump-Renewal","Accept":"*/*","Cache-Control":"no-cache"})
+    ctx=ssl.create_default_context()
+    if boolean(os.environ.get("SUBSCRIPTION_INSECURE","0")):
+        ctx.check_hostname=False;ctx.verify_mode=ssl.CERT_NONE
+    with urllib.request.urlopen(req,timeout=30,context=ctx) as r:return r.read()
 
 def load_pool():
-
-    pool_file = os.environ.get(
-        "POOL_FILE",
-        "pool.json"
-    )
-
-    if not os.path.exists(
-        pool_file
-    ):
-        return []
-
+    f=os.environ.get("POOL_FILE","pool.json")
+    if not os.path.exists(f):return []
     try:
+        with open(f,encoding="utf-8") as h:d=json.load(h)
+        return [x for x in d if isinstance(x,dict) and x.get("server") and x.get("port")]
+    except:return []
 
-        with open(
-            pool_file,
-            "r",
-            encoding="utf-8"
-        ) as f:
+def config(obs):
+    if len(obs)==1:obs[0]["tag"]="proxy"; outs=obs+[ {"type":"direct","tag":"direct"} ]
+    else:
+        for j,o in enumerate(obs,1):o["tag"]=o.get("tag") or "node-%d"%j
+        outs=obs+[{"type":"urltest","tag":"proxy","outbounds":[o["tag"] for o in obs],"url":TEST_URL,"interval":"30s","tolerance":50},{"type":"direct","tag":"direct"}]
+    return {"log":{"level":"info","timestamp":True},"inbounds":[{"type":"http","tag":"http-in","listen":LISTEN_HOST,"listen_port":LISTEN_PORT}],"outbounds":outs,"route":{"final":"proxy"}}
 
-            data = json.load(f)
-
-        return [
-            node
-            for node in data
-            if node.get("server")
-            and node.get("port")
-        ]
-
-    except Exception as e:
-
-        print(
-            f"Warning: failed to load pool.json: {e}"
-        )
-
-        return []
-
-
-def build_pool_outbounds(
-    base_out,
-    pool_nodes
-):
-
-    outbounds = []
-
-    for index, node in enumerate(
-        pool_nodes,
-        1
-    ):
-
-        outbound = json.loads(
-            json.dumps(
-                base_out
-            )
-        )
-
-        outbound["tag"] = (
-            f"node-{index}"
-        )
-
-        outbound["server_port"] = int(
-            node["port"]
-        )
-
-        if node.get("sni"):
-
-            outbound.setdefault(
-                "tls",
-                {}
-            )
-
-            outbound["tls"][
-                "enabled"
-            ] = True
-
-            outbound["tls"][
-                "server_name"
-            ] = node["sni"]
-
-        outbounds.append(
-            outbound
-        )
-
-    outbounds.append(
-        {
-            "type": "urltest",
-            "tag": "proxy",
-            "outbounds": [
-                f"node-{i}"
-                for i in range(
-                    1,
-                    len(pool_nodes) + 1
-                )
-            ],
-            "url": TEST_URL,
-            "interval": "30s",
-        }
-    )
-
-    outbounds.append(
-        {
-            "type": "direct",
-            "tag": "direct",
-        }
-    )
-
-    return outbounds
-
-
-# ============================================================
-# Config writer
-# ============================================================
-
-def write_config(
-    outbounds
-):
-
-    config = {
-        "log": {
-            "level": "info",
-            "timestamp": True,
-        },
-
-        "inbounds": [
-            {
-                "type": "http",
-                "tag": "http-in",
-                "listen": LISTEN_HOST,
-                "listen_port": LISTEN_PORT,
-            }
-        ],
-
-        "outbounds": outbounds,
-
-        "route": {
-            "final": "proxy"
-        }
-    }
-
-    with open(
-        "config.json",
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            config,
-            f,
-            indent=2,
-            ensure_ascii=False
-        )
-
-    print(
-        "sing-box config.json generated."
-    )
-
-    print(
-        f"  Inbound: "
-        f"http://{LISTEN_HOST}:{LISTEN_PORT}"
-    )
-
-
-# ============================================================
-# Main
-# ============================================================
+def write(obs):
+    with open("config.json","w",encoding="utf-8") as f:json.dump(config(obs),f,indent=2,ensure_ascii=False)
+    print("sing-box config.json generated.")
+    print("  Inbound: http://%s:%d"%(LISTEN_HOST,LISTEN_PORT));print("  Nodes: %d"%len(obs));print("  Selector: urltest -> proxy")
 
 def main():
+    url=os.environ.get("PROXY_URL","").strip()
+    if not url:return 0
+    scheme=url.split("://",1)[0].lower()
+    if scheme in {"vless","vmess","trojan","hysteria2","hy2","anytls","tuic","socks5","socks"}:
+        try:o=parse_uri(url);obs=[o]
+        except Exception as e:print("Error: %s"%e);return 1
+        if o["type"]=="anytls" and load_pool():
+            base=o;obs=[]
+            for j,n in enumerate(load_pool(),1):
+                x=copy.deepcopy(base);x["tag"]="node-%d"%j;x["server_port"]=int(n["port"])
+                if n.get("server"):x["server"]=n["server"]
+                if n.get("sni"):x.setdefault("tls",{})["server_name"]=n["sni"]
+                obs.append(x)
+        write(obs);return 0
+    if scheme in ("http","https"):
+        print("Subscription mode: downloading subscription...")
+        print("  URL: %s"%(url.split("?",1)[0]+("***" if "?" in url else "")))
+        try:body=fetch(url)
+        except Exception as e:print("Error: failed to download subscription: %s"%e);return 1
+        print("  Subscription downloaded: %d bytes"%len(body))
+        obs=collect(body)
+        if not obs:
+            print("Subscription downloaded, but no supported proxy node was found.")
+            print("Supported: vless / vmess / trojan / hysteria2 / anytls / tuic / socks5 / http")
+            print("Subscription formats: plain URI / base64 / YAML / JSON")
+            return 1
+        print("Found %d supported proxy node(s)."%len(obs));write(obs);return 0
+    print("Unsupported PROXY_URL scheme: %s"%scheme);return 1
 
-    proxy_url = os.environ.get(
-        "PROXY_URL",
-        ""
-    ).strip()
-
-    subscription_url = os.environ.get(
-        "SUBSCRIPTION_URL",
-        ""
-    ).strip()
-
-    source_url = (
-        subscription_url
-        or proxy_url
-    )
-
-    if not source_url:
-
-        print(
-            "PROXY_URL/SUBSCRIPTION_URL "
-            "is empty, skipping proxy."
-        )
-
-        sys.exit(0)
-
-    # ========================================================
-    # Subscription mode
-    # ========================================================
-
-    if (
-        subscription_url
-        or is_subscription_url(
-            source_url
-        )
-    ):
-
-        print(
-            "Subscription mode: "
-            "downloading subscription..."
-        )
-
-        # 不在日志里打印 token。
-        safe_url = source_url.split(
-            "?",
-            1
-        )[0]
-
-        print(
-            f"  URL: {safe_url}***"
-        )
-
-        try:
-
-            raw = fetch_subscription(
-                source_url
-            )
-
-            uri_list = decode_subscription(
-                raw
-            )
-
-        except Exception as e:
-
-            print(
-                f"Failed to download/parse "
-                f"subscription: {e}"
-            )
-
-            sys.exit(1)
-
-        if not uri_list:
-
-            print(
-                "Subscription downloaded, "
-                "but no supported proxy URI "
-                "was found."
-            )
-
-            print(
-                "Supported:"
-            )
-
-            print(
-                "  vless / vmess / trojan / "
-                "hysteria2 / anytls / tuic / "
-                "socks5 / http"
-            )
-
-            sys.exit(1)
-
-        print(
-            f"  Found {len(uri_list)} "
-            f"proxy nodes"
-        )
-
-        try:
-
-            outbounds = (
-                build_subscription_outbounds(
-                    uri_list
-                )
-            )
-
-        except Exception as e:
-
-            print(
-                f"Failed to build "
-                f"subscription outbounds: {e}"
-            )
-
-            sys.exit(1)
-
-        write_config(
-            outbounds
-        )
-
-        proxy_nodes = [
-            x
-            for x in outbounds
-            if x.get("tag") != "proxy"
-            and x.get("tag") != "direct"
-            and x.get("type") != "urltest"
-        ]
-
-        print(
-            f"  Usable nodes: "
-            f"{len(proxy_nodes)}"
-        )
-
-        if len(proxy_nodes) == 1:
-
-            print(
-                "  Selector: direct proxy"
-            )
-
-        else:
-
-            print(
-                "  Selector: "
-                "urltest -> proxy"
-            )
-
-        return
-
-    # ========================================================
-    # Single URI mode
-    # ========================================================
-
-    scheme = source_url.split(
-        "://",
-        1
-    )[0].lower()
-
-    print(
-        f"Parsing proxy URI "
-        f"({scheme}://***)"
-    )
-
-    try:
-
-        outbound, name = parse_proxy_uri(
-            source_url
-        )
-
-    except Exception as e:
-
-        print(
-            f"Unsupported/invalid "
-            f"proxy URI: {e}"
-        )
-
-        sys.exit(1)
-
-    if name:
-
-        outbound["tag"] = safe_tag(
-            name,
-            1
-        )
-
-    else:
-
-        outbound["tag"] = "proxy"
-
-    # ========================================================
-    # anytls pool
-    # ========================================================
-
-    outbounds = [
-        outbound,
-        {
-            "type": "direct",
-            "tag": "direct",
-        }
-    ]
-
-    if scheme == "anytls":
-
-        pool = load_pool()
-
-        if pool:
-
-            node_outbounds = (
-                build_pool_outbounds(
-                    outbound,
-                    pool
-                )
-            )
-
-            if node_outbounds:
-
-                outbounds = node_outbounds
-
-                print(
-                    f"  Pool mode: "
-                    f"{len(pool)} nodes + urltest"
-                )
-
-    write_config(
-        outbounds
-    )
-
-    server = outbound.get(
-        "server",
-        "N/A"
-    )
-
-    port = outbound.get(
-        "server_port",
-        "N/A"
-    )
-
-    print(
-        f"  Outbound: "
-        f"{outbound['type']} "
-        f"-> {server}:{port}"
-    )
-
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__":sys.exit(main())
