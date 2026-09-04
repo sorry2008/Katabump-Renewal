@@ -24,6 +24,7 @@ import sys
 import json
 import base64
 import ssl
+import re
 import urllib.request
 from urllib.parse import urlparse, parse_qs, unquote
 
